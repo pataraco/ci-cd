@@ -1,0 +1,314 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Jenkins Server: 1 IAM Role, 1 IAM Policy, I ELB, 1 EC2, 1 SG, 1 DNS Record.'
+
+Parameters:
+  VpcIdExport:
+    Type: String
+    Description: The exported value of the VPC to be used.
+    Default: non-prod-jenkins-vpc-stk-vpcId
+
+  SubnetA:
+    Type: String
+    Default: subnet-20051c6b
+
+  SubnetB:
+    Type: String
+    Default: subnet-21d0857c
+
+  InstanceType:
+    Type: String
+    Default: t2.medium
+    Description: instance class
+    AllowedValues:
+      - t2.medium
+      - t2.large
+      - t2.medium
+      - t2.xlarge
+      - c4.8xlarge
+      - c4.4xlarge
+      - c4.2xlarge
+      - c4.xlarge
+      - c4.large
+
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: onica-swa
+
+  # Tags to apply to the ASG instances
+  Name:
+    Type: String
+    Default: Jenkins
+
+  AppName:
+    Type: String
+    Default: Jenkins
+
+  Environment:
+    Type: String
+    Default: Test
+
+  Owner:
+    Type: String
+    Default: Onica
+
+  ELbName:
+    Type: String
+    Default: JenkinsELb
+
+  JenkinsPlugins:
+    Type: String
+    Description: Space seperate list of Jenkins plugins to install.
+    Default: powershell bitbucket gradle pipeline blueocean job-dsl ldap workflow-aggregator windows-slaves ws-cleanup credentials-binding envinject git msbuild
+
+Mappings:
+  AMIRegionMap:
+    us-east-1:
+      AMI: "ami-97785bed"
+    us-west-2:
+      AMI: "ami-f2d3638a"
+
+
+###### RESOURCES #####
+Resources:
+
+  JenkinsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow http to client host
+      VpcId:
+        Fn::ImportValue:
+          !Sub ${VpcIdExport}
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: '8080'
+          ToPort: '8080'
+          CidrIp: '0.0.0.0/0'
+        - IpProtocol: tcp
+          FromPort: '80'
+          ToPort: '80'
+          CidrIp: '0.0.0.0/0'
+        - IpProtocol: tcp
+          FromPort: '22'
+          ToPort: '22'
+          CidrIp: '0.0.0.0/0'
+        - IpProtocol: icmp
+          FromPort: '8'
+          ToPort: '-1'
+          CidrIp: 0.0.0.0/0
+
+      Tags:
+        - Key: Name
+          Value: !Ref Name
+
+  JenkinsRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: "jenkins_master_role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Principal:
+              AWS:
+                - arn:aws:iam::540060942748:role/JenkinsAssumedRole
+                - arn:aws:iam::454194040007:role/JenkinsAssumedRole
+              Service:
+                - "ec2.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        -
+          PolicyName: "jenkins_master_role_policy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action: "*"
+                Resource: "*"
+
+  JenkinsProfile:
+    Type: "AWS::IAM::InstanceProfile"
+    Properties:
+      Roles:
+        - !Ref JenkinsRole
+      InstanceProfileName: JenkinsMaster
+
+
+  JenkinsElb:
+    Type: AWS::ElasticLoadBalancing::LoadBalancer
+    Properties:
+      Scheme: internal
+      Subnets:
+        - !Ref SubnetA
+        - !Ref SubnetB
+      Instances:
+        - !Ref JenkinsEc2Instance
+      CrossZone: true
+      LoadBalancerName: !Ref ELbName
+      SecurityGroups:
+        - !Ref JenkinsSecurityGroup
+      Listeners:
+        - LoadBalancerPort: '80'
+          InstancePort: '8080'
+          Protocol: HTTP
+      HealthCheck:
+        Target:
+          Fn::Join:
+            - ''
+            - - 'HTTP:8080'
+              - "/login"
+        HealthyThreshold: '3'
+        UnhealthyThreshold: '5'
+        Interval: '30'
+        Timeout: '5'
+      Tags:
+        - Key: Name
+          Value: !Ref Name
+        - Key: Env
+          Value: !Ref Environment
+        - Key: AppName
+          Value: !Ref AppName
+
+  JenkinsDNSRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneName: hoth.fun.
+      Comment: DNS name for OpsSuite Cloud Jenkins
+      Name: jenkins.hoth.fun
+      Type: CNAME
+      TTL: '900'
+      ResourceRecords:
+        - !GetAtt JenkinsElb.DNSName
+
+  JenkinsEc2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !FindInMap [AMIRegionMap, !Ref "AWS::Region", AMI]
+      SubnetId: !Ref SubnetA
+      SecurityGroupIds:
+        - !Ref JenkinsSecurityGroup
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref JenkinsProfile
+      KeyName: !Ref KeyName
+      Tags:
+        - Key: Name
+          Value: !Ref Name
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref Owner
+
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          set -ex
+
+          # Set the plugins to install
+          plugins_execute=("powershell bitbucket blueocean gradle pipeline job-dsl ldap workflow-aggregator windows-slaves ws-cleanup credentials-binding envinject git msbuild ansicolor")
+
+          ## update machine before anything else
+          yum -y update
+
+          yum install -y wget git jq java-1.8.0 unzip
+          ## get jenkins repo and install it
+          wget -O /etc/yum.repos.d/jenkins.repo http://pkg.jenkins-ci.org/redhat-stable/jenkins.repo
+          rpm --import https://pkg.jenkins.io/redhat/jenkins.io.key
+          wget https://releases.hashicorp.com/packer/1.1.0/packer_1.1.0_linux_amd64.zip
+          unzip -d /usr/sbin/packerio packer_1.1.0_linux_amd64.zip
+          rm -f packer_1.1.0_linux_amd64.zip
+          yum install -y jenkins
+          sed -i -e 's/JENKINS_JAVA_OPTIONS=.*/JENKINS_JAVA_OPTIONS="-Djava.awt.headless=true -Djava.net.preferIPv4Stack=true -Djenkins.install.runSetupWizard=false"/' /etc/sysconfig/jenkins
+          yum -y remove java-1.7.0
+          ## these are for redhat installs
+          #firewall-cmd --zone=public --add-port=8080/tcp --permanent
+          #service firewalld restart
+          #iptables-save
+          service jenkins start
+          chkconfig jenkins on
+
+          # ## download the CLI
+          # until wget -O /home/ec2-user/jenkins-cli.jar http://localhost:8080/jnlpJars/jenkins-cli.jar; do
+          #   echo "Trying to download jenkins-cli.jar"
+          #   sleep 1
+          # done
+
+          cat << 'EOT' >> install_jenkins_plugins.sh
+          #!/bin/bash
+
+          set -e
+
+          if [ $# -eq 0 ]; then
+            echo "USAGE: $0 plugin1 plugin2 ..."
+            exit 1
+          fi
+
+          plugin_dir=/var/lib/jenkins/plugins
+          file_owner=jenkins.jenkins
+
+          mkdir -p /var/lib/jenkins/plugins
+
+          installPlugin() {
+            if [ -f ${plugin_dir}/${1}.hpi -o -f ${plugin_dir}/${1}.jpi ]; then
+              if [ "$2" == "1" ]; then
+                return 1
+              fi
+              echo "Skipped: $1 (already installed)"
+              return 0
+            else
+              echo "Installing: $1"
+              curl -L --silent --output ${plugin_dir}/${1}.hpi  https://updates.jenkins-ci.org/latest/${1}.hpi
+              return 0
+            fi
+          }
+
+          for plugin in $*
+          do
+              installPlugin "$plugin"
+          done
+
+          changed=1
+          maxloops=100
+
+          while [ "$changed"  == "1" ]; do
+            echo "Check for missing dependecies ..."
+            if  [ $maxloops -lt 1 ] ; then
+              echo "Max loop count reached - probably a bug in this script: $0"
+              exit 1
+            fi
+            ((maxloops--))
+            changed=0
+            for f in ${plugin_dir}/*.hpi ; do
+              # without optionals
+              deps=$( unzip -p ${f} META-INF/MANIFEST.MF | tr -d '\r' | sed -e ':a;N;$!ba;s/\n //g' | grep -e "^Plugin-Dependencies: " | awk '{ print $2 }' | tr ',' '\n' | grep -v "resolution:=optional" | awk -F ':' '{ print $1 }' | tr '\n' ' ' )
+              # # with optionals
+              # deps=$( unzip -p ${f} META-INF/MANIFEST.MF | grep -e "[a-z-]:[0-9]" | tr -d "\r\n " | sed "s/Plugin-Dependencies://" | tr ',' '\n' | awk -F ':' '{ print $1 }' )
+              for plugin in $deps; do
+                installPlugin "$plugin" 1 && changed=1
+              done
+            done
+          done
+
+          echo "fixing permissions"
+
+          chown ${file_owner} ${plugin_dir} -R
+
+          echo "all done"
+          EOT
+
+          # fix perms on our script
+          chmod 744 install_jenkins_plugins.sh
+          . ./install_jenkins_plugins.sh ${plugins_execute}
+
+          rm install_jenkins_plugins.sh
+          ## final cleanup
+          # rm -rf /home/ec2-user/jenkins-cli.jar
+
+          service jenkins restart
+
+          # Install Runway
+          pip install runway
+          sudo yum-config-manager --enable epel
+          yum install ansible -y

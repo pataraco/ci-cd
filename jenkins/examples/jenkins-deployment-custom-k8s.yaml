@@ -1,0 +1,143 @@
+apiVersion: extensions/v1beta1
+kind: Deployment
+metadata:
+  name: jenkins
+  namespace: jenkins
+spec:
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: master
+    spec:
+      containers:
+      - name: master
+        image: jenkins/jenkins:lts
+        ports:
+        - containerPort: 8080
+        - containerPort: 50000
+        readinessProbe:
+          httpGet:
+            path: /login
+            port: 8080
+          periodSeconds: 10
+          timeoutSeconds: 5
+          successThreshold: 2
+          failureThreshold: 5
+# Since this is a new Jenkins installation, it will want you to go through the
+# configuration wizard to setup an admin user and plugins. However, as we’re going
+# to provide our configuration from version control, we need to disable this first
+# step. So let’s turn this off.
+# java -Duser.home=/var/jenkins_home -Djenkins.install.runSetupWizard=false -jar /usr/share/jenkins/jenkins.war
+        env:
+        - name: JAVA_OPTS
+          value: "-Djenkins.install.runSetupWizard=false"
+        volumeMounts:
+        - mountPath: /usr/share/jenkins/ref
+          name: ref-volume
+        - mountPath: /var/jenkins_home/.ssh
+          name: ssh-volume
+#
+# The following init container clone-repo will copy the keys, create an ssh
+# configuration and clone the repository:
+# We first add a few volume mounts that we need. These contain Jenkins data,
+# secrets and the ssh keys we created earlier.
+# Volume secret-volume = (/etc/secret-volume) uses the ssh-key-secret that was
+# created in the ConfigMap
+# kubectl create secret generic ssh-key-secret \
+#         --from-file=ssh-privatekey=./dsimpson-spireon-github \
+#         --from-file=ssh-publickey=./dsimpson-spireon-github.pub
+# we copy the ssh keys to the ~/.ssh volume and set their permissions to 400
+# using cp /etc/secret-volume/ssh-privatekey ~/.ssh/id_rsa;
+# cp /etc/secret-volume/ssh-publickey ~/.ssh/id_rsa.pub;
+# chmod 400 ~/.ssh/*;
+# Creates ~/.ssh/config
+          # host bitbucket.org
+          #  HostName bitbucket.org
+          #  IdentityFile ~/.ssh/id_rsa
+          #  User jenkins
+      initContainers:
+      - name: clone-repo
+        image: jenkins/jenkins:lts
+        command:
+          - /bin/sh
+          - -c
+          - cp /etc/secret-volume/ssh-privatekey ~/.ssh/id_rsa ;
+            cp /etc/secret-volume/ssh-publickey ~/.ssh/id_rsa.pub ;
+            chmod 400 ~/.ssh/* ;
+            printf "host bitbucket.org\n HostName bitbucket.org\n IdentityFile ~/.ssh/id_rsa\n User jenkins" > ~/.ssh/config ;
+            ssh-keyscan bitbucket.org >> ~/.ssh/known_hosts ;
+            cd /usr/share/jenkins/ref ;
+            git clone git@bitbucket.org:dsimpsononica/spireon-kubernetes.git
+        volumeMounts:
+        - mountPath: /usr/share/jenkins/ref
+          name: ref-volume
+        - mountPath: /etc/secret-volume
+          name: secret-volume
+          readOnly: true
+        - mountPath: /var/jenkins_home/.ssh
+          name: ssh-volume
+# add another init container that’s going to install some plugins to
+# {$JENKINS_HOME}/ref/plugins. Jenkins will then pick these up when our
+# master container starts.
+      - name: install-plugins
+        image: jenkins/jenkins:lts
+        command:
+          - /bin/sh
+          - -c
+          - install-plugins.sh < /usr/share/jenkins/ref/spireon-kubernetes/cicd/jenkins/plugins
+        volumeMounts:
+        - mountPath: /usr/share/jenkins/ref
+          name: ref-volume
+# We’re also going to setup authentication for Jenkins as it would be a
+# really bad idea to leave it open to the world! The below will also execute a
+# security.groovy script when Jenkins starts up. This script will setup and save
+# to the home directory the API token and password needed for the admin user to
+# connect to Jenkins. To get the password printed to stdout, we’ll need to
+# grep the Jenkins logs for it. Run kubectl logs deployment/jenkins | grep password
+# and the admin password will be printed to stdout.
+# Now we can use MY_POD_IP and MASTER_URL as environment variables.
+# In the config.xml.override:
+# <jenkinsUrl>http://${MY_POD_IP}:8080</jenkinsUrl> = <jenkinsUrl>http://100.96.7.3:8080</jenkinsUrl>
+# <serverUrl>${MASTER_URL}</serverUrl> becomes <serverUrl>https://api.k8s-spireon-stage01.local</serverUrl>
+      - name: override-config
+        image: jenkins/jenkins:lts
+        env:
+        - name: MY_POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: MASTER_URL
+          valueFrom:
+            configMapKeyRef:
+              name: kube-master
+              key: master.url
+        command:
+          - /bin/sh
+          - -c
+          - cp /usr/share/jenkins/ref/spireon-kubernetes/cicd/jenkins/overrides/config.xml.override /usr/share/jenkins/ref/config.xml.override ;
+               /usr/share/jenkins/ref/spireon-kubernetes/cicd/jenkins/scripts/hack-jenkins-env.sh ;
+               mkdir /usr/share/jenkins/ref/init.groovy.d ;
+               cp /usr/share/jenkins/ref/spireon-kubernetes/cicd/jenkins/scripts/security.groovy /usr/share/jenkins/ref/init.groovy.d/security.groovy
+        volumeMounts:
+        - mountPath: /usr/share/jenkins/ref
+          name: ref-volume
+# # To get this job into a state where it can be deployed from a VCS,
+# # we configured it in the Jenkins UI and then copied the {JENKINS_HOME}/jobs folder.
+      - name: copy-jobs
+        image: jenkins/jenkins:lts
+        command:
+          - /bin/sh
+          - -c
+          - cp -r /usr/share/jenkins/ref/spireon-kubernetes/cicd/jenkins/jobs /usr/share/jenkins/ref/
+        volumeMounts:
+        - mountPath: /usr/share/jenkins/ref
+          name: ref-volume
+      volumes:
+      - name: ref-volume
+        emptyDir: {}
+      - name: ssh-volume
+        emptyDir: {}
+      - name: secret-volume
+        secret:
+          secretName: ssh-key-secret
